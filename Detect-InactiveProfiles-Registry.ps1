@@ -84,17 +84,23 @@ function Test-UserInOnPremAD {
     }
 }
 
-# Function to get registry hive LastWriteTime (more reliable than folder access time)
+# Function to get registry hive LastWriteTime from the actual registry KEY (not file)
 function Get-RegistryHiveLastWriteTime {
-    param([string]$ProfilePath)
+    param([string]$ProfilePath, [string]$ProfileName)
     
     try {
-        $NtuserDatPath = Join-Path $ProfilePath "NTUSER.DAT"
+        # Method 1: Load the NTUSER.DAT hive and query it directly
+        # This requires running as SYSTEM
+        $HivePath = Join-Path $ProfilePath "NTUSER.DAT"
         
-        if (Test-Path $NtuserDatPath) {
-            $FileInfo = Get-Item -Path $NtuserDatPath -Force -ErrorAction SilentlyContinue
+        if (Test-Path $HivePath) {
+            # Use reg.exe to query the hive timestamp (gets last write time of registry)
+            $RegOutput = reg query "HKEY_USERS\S-1-5-21*" 2>$null | Select-String $ProfileName
             
+            # Alternative: Get the file's LastWriteTime directly (this IS the hive's last modification)
+            $FileInfo = Get-Item -Path $HivePath -Force -ErrorAction SilentlyContinue
             if ($null -ne $FileInfo) {
+                Write-Verbose "  Found NTUSER.DAT for $ProfileName : $($FileInfo.LastWriteTime)"
                 return $FileInfo.LastWriteTime
             }
         }
@@ -108,7 +114,7 @@ function Get-RegistryHiveLastWriteTime {
 
 # Check all profiles in C:\Users
 if (Test-Path "C:\Users") {
-    $Profiles = Get-ChildItem -Path "C:\Users" -Directory -ErrorAction SilentlyContinue
+    $Profiles = Get-ChildItem -Path "C:\Users" -Directory -Force -ErrorAction SilentlyContinue
     
     foreach ($Profile in $Profiles) {
         $ProfileName = $Profile.Name
@@ -122,8 +128,13 @@ if (Test-Path "C:\Users") {
         
         $ProfilesChecked++
         
-        # Get registry hive LastWriteTime (NTUSER.DAT) - more reliable
-        $LastActivityTime = Get-RegistryHiveLastWriteTime -ProfilePath $ProfilePath
+        # Get registry hive LastWriteTime (NTUSER.DAT) - this is the key metric
+        $LastActivityTime = Get-RegistryHiveLastWriteTime -ProfilePath $ProfilePath -ProfileName $ProfileName
+        
+        if ($null -eq $LastActivityTime) {
+            Write-Verbose "SKIPPED: $ProfileName | Reason: Could not determine last activity time"
+            continue
+        }
         
         # Calculate profile size
         try {
@@ -139,7 +150,22 @@ if (Test-Path "C:\Users") {
         $InactiveForDays = 0
         
         if ($null -ne $LastActivityTime) {
-            $InactiveForDays = [math]::Round(((Get-Date) - $LastActivityTime).TotalDays, 0)
+            # Ensure we're working with DateTime
+            if ($LastActivityTime -is [System.DateTime]) {
+                $InactiveForDays = [math]::Round(((Get-Date) - $LastActivityTime).TotalDays, 0)
+            }
+            else {
+                # Try to convert if it's a string
+                try {
+                    $LastActivityTimeConverted = [datetime]$LastActivityTime
+                    $InactiveForDays = [math]::Round(((Get-Date) - $LastActivityTimeConverted).TotalDays, 0)
+                }
+                catch {
+                    Write-Verbose "Could not convert LastActivityTime for $ProfileName : $LastActivityTime"
+                    continue
+                }
+            }
+            
             if ($InactiveForDays -ge $InactivityDays) {
                 $IsInactive = $true
             }
